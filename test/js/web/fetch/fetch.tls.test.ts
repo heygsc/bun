@@ -68,6 +68,77 @@ describe.concurrent("fetch-tls", () => {
     });
   });
 
+  // https://github.com/oven-sh/bun/issues/30668
+  // The URL parser keeps the surrounding `[`/`]` on IPv6 hostnames. That bracketed
+  // form must NOT leak into TLS certificate verification: strings.isIPAddress("[::1]")
+  // is false, which causes the native fast path to skip the IP-SAN branch, and
+  // node:tls.checkServerIdentity (net.isIP("[::1]") === 0) likewise falls through
+  // to CN matching. Node.js strips brackets in urlToHttpOptions before either
+  // verification path runs. The test CERT_LOCALHOST_IP has IP SAN `::1`, so
+  // a request to https://[::1]:port/ must succeed on both paths.
+  //
+  // Runs as a subprocess so we can clear HTTP_PROXY / HTTPS_PROXY without racing
+  // with other concurrent tests in this file's shared JS process env.
+  it("fetch with IPv6 literal hostname verifies the certificate", async () => {
+    await createServer(CERT_LOCALHOST_IP, async port => {
+      const { HTTP_PROXY, HTTPS_PROXY, http_proxy, https_proxy, ...cleanEnv } = bunEnv;
+      await using proc = Bun.spawn({
+        cmd: [
+          bunExe(),
+          "-e",
+          `
+            const tls = require("node:tls");
+            const cert = ${JSON.stringify(validTls.cert)};
+            const url = "https://[::1]:${port}/";
+            // Native fast path — no user-supplied checkServerIdentity. Native
+            // checkX509ServerIdentity must see "::1" (not "[::1]") so that
+            // strings.isIPAddress() picks the IP-SAN branch.
+            {
+              const res = await fetch(url, {
+                keepalive: false,
+                tls: { ca: cert, rejectUnauthorized: true },
+              });
+              console.log("native:", await res.text());
+            }
+            // User-supplied checkServerIdentity path — the hostname handed to
+            // the callback must be bracket-stripped so that
+            // node:tls.checkServerIdentity (net.isIP) accepts it, matching
+            // Node.js's urlToHttpOptions behavior.
+            {
+              let observed;
+              const res = await fetch(url, {
+                keepalive: false,
+                tls: {
+                  ca: cert,
+                  rejectUnauthorized: true,
+                  checkServerIdentity(hostname, cert) {
+                    observed = hostname;
+                    return tls.checkServerIdentity(hostname, cert);
+                  },
+                },
+              });
+              console.log("callback hostname:", observed);
+              console.log("js:", await res.text());
+            }
+          `,
+        ],
+        env: cleanEnv,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([
+        proc.stdout.text(),
+        proc.stderr.text(),
+        proc.exited,
+      ]);
+      expect({ stdout, stderr, exitCode }).toEqual({
+        stdout: "native: Hello World\ncallback hostname: ::1\njs: Hello World\n",
+        stderr: "",
+        exitCode: 0,
+      });
+    });
+  });
+
   it("fetch with valid tls and non-native checkServerIdentity should work", async () => {
     await createServer(CERT_LOCALHOST_IP, async port => {
       for (const isBusy of [true, false]) {
