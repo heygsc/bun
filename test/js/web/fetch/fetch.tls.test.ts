@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { bunEnv, bunExe, isASAN, tmpdirSync } from "harness";
+import { bunEnv, bunExe, isASAN, isIPv6, tmpdirSync } from "harness";
 import { join } from "node:path";
 import tls from "node:tls";
 
@@ -70,7 +70,7 @@ describe.concurrent("fetch-tls", () => {
 
   // https://github.com/oven-sh/bun/issues/30668
   // The URL parser keeps the surrounding `[`/`]` on IPv6 hostnames. That bracketed
-  // form must NOT leak into TLS certificate verification: strings.isIPAddress("[::1]")
+  // form must NOT leak into TLS certificate verification: strings::is_ip_address("[::1]")
   // is false, which causes the native fast path to skip the IP-SAN branch, and
   // node:tls.checkServerIdentity (net.isIP("[::1]") === 0) likewise falls through
   // to CN matching. Node.js strips brackets in urlToHttpOptions before either
@@ -79,7 +79,11 @@ describe.concurrent("fetch-tls", () => {
   //
   // Runs as a subprocess so we can clear HTTP_PROXY / HTTPS_PROXY without racing
   // with other concurrent tests in this file's shared JS process env.
-  it("fetch with IPv6 literal hostname verifies the certificate", async () => {
+  //
+  // Skipped on Buildkite Linux — those AWS instances don't have IPv6 set up
+  // (see `isIPv6` in harness.ts). Matches the gating pattern already used by
+  // the directly analogous valkey-tls-verify.test.ts:177.
+  it.skipIf(!isIPv6())("fetch with IPv6 literal hostname verifies the certificate", async () => {
     await createServer(CERT_LOCALHOST_IP, async port => {
       const { HTTP_PROXY, HTTPS_PROXY, http_proxy, https_proxy, ...cleanEnv } = bunEnv;
       await using proc = Bun.spawn({
@@ -91,8 +95,8 @@ describe.concurrent("fetch-tls", () => {
             const cert = ${JSON.stringify(validTls.cert)};
             const url = "https://[::1]:${port}/";
             // Native fast path — no user-supplied checkServerIdentity. Native
-            // checkX509ServerIdentity must see "::1" (not "[::1]") so that
-            // strings.isIPAddress() picks the IP-SAN branch.
+            // check_x509_server_identity must see "::1" (not "[::1]") so that
+            // strings::is_ip_address() picks the IP-SAN branch.
             {
               const res = await fetch(url, {
                 keepalive: false,
@@ -131,11 +135,11 @@ describe.concurrent("fetch-tls", () => {
         proc.stderr.text(),
         proc.exited,
       ]);
-      expect({ stdout, stderr, exitCode }).toEqual({
-        stdout: "native: Hello World\ncallback hostname: ::1\njs: Hello World\n",
-        stderr: "",
-        exitCode: 0,
-      });
+      // Asserting stdout/stderr before exitCode produces a more useful
+      // failure message when the subprocess crashes unexpectedly.
+      expect(stdout).toBe("native: Hello World\ncallback hostname: ::1\njs: Hello World\n");
+      expect(stderr).toBe("");
+      expect(exitCode).toBe(0);
     });
   });
 
